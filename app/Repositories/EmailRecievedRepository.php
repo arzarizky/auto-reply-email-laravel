@@ -21,25 +21,19 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
         'emailReply'
     ];
 
-    private function canSend($dataId)
+    public function canSend($dataId)
     {
-
         $emailContent = EmailContent::where('user_id', $dataId)->first();
         $mailServerSetting = MailServer::where('user_id', $dataId)->first();
 
-
-        if (!$emailContent || !$mailServerSetting || $emailContent->auto_replied == 0 || $emailContent->end_auto_replied < now()->format('Y-m-d')) {
-            $message = !$emailContent || $emailContent->auto_replied == 0
-                       ? "Auto-reply is disabled"
-                       : (!$mailServerSetting ? "Mail server settings not found" : "Auto-reply period has ended");
-            return [
-                "sukses" => false,
-                "pesan" => $message,
-                "datas" => null
-            ];
+        // Early exit for conditions not met
+        if (!$emailContent || !$mailServerSetting) {
+            return $this->generateErrorResponse("Mail server settings or email content not found");
         }
 
-
+        if ($emailContent->auto_replied == 0 || $emailContent->end_auto_replied < now()->format('Y-m-d')) {
+            return $this->generateErrorResponse("Auto-reply is disabled or the period has ended");
+        }
 
         $client = Client::make([
             'host'          => $mailServerSetting->host,
@@ -53,12 +47,10 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
 
         $client->connect();
 
+        // Check if 'Sent' folder exists
         if (!$client->getFolder('Sent')) {
             $client->disconnect();
-            return [
-                "sukses" => false,
-                "pesan" => "Sent folder not found on mail server."
-            ];
+            return $this->generateErrorResponse("Sent folder not found on mail server.");
         }
 
         return [
@@ -70,10 +62,21 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
         ];
     }
 
-    private function sendAutoReply($mailServerSetting, $emailContent, $user, $client)
+    public function generateErrorResponse($message)
+    {
+        return [
+            "sukses" => false,
+            "pesan" => $message,
+            "datas" => null
+        ];
+    }
+
+    public function sendAutoReply($mailServerSetting, $emailContent, $user, $client)
     {
         try {
+
             $inbox = $client->getFolder('INBOX');
+
             $messages = $inbox->query()
                 ->since($emailContent->start_auto_replied)
                 ->unseen()
@@ -100,6 +103,7 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
                 $receivedAt = $originalMessage->getDate();
 
                 if ($emailFrom === null) {
+
                     DB::rollBack();
                     return [
                         "sukses" => false,
@@ -109,6 +113,7 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
 
                 $originalMessageId = $originalMessage->getMessageId()->first();
 
+                // Check if this message already exists in the database
                 $exists = EmailReceived::where('user_id', $user->id)
                     ->where('message_id', $originalMessageId)
                     ->where('subject', $originSubject)
@@ -117,10 +122,12 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
                     ->where('received_at', $receivedAt)
                     ->first();
 
+                // If it exists, skip it
                 if ($exists) {
-                    continue; // Skip this message if it already exists
+                    continue;
                 }
 
+                // Create a new EmailReceived record
                 $received = EmailReceived::create([
                     'user_id'     => $user->id,
                     'message_id'  => $originalMessageId,
@@ -131,14 +138,17 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
                     'received_at' => $receivedAt
                 ]);
 
+                // Create SwiftMailer transport and initialize the mailer
                 $transport = (new Swift_SmtpTransport($mailServerSetting->host, 587, 'tls'))
                     ->setUsername($mailServerSetting->username)
                     ->setPassword($mailServerSetting->password);
 
                 $mailer = new Swift_Mailer($transport);
 
+                // Handle CC Emails
                 $ccEmails = $emailContent->cc ? array_map('trim', explode(',', $emailContent->cc)) : [];
 
+                // Prepare the reply message
                 $replyMessage = (new \Swift_Message("Re: " . $originSubject))
                     ->setFrom([$user->email => $user->name])
                     ->setTo([$emailFrom => $nameFrom])
@@ -152,6 +162,7 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
                 $replyMessage->getHeaders()->addTextHeader('In-Reply-To', $originalMessageId);
                 $replyMessage->getHeaders()->addTextHeader('References', $originalMessageId);
 
+                // Send the reply message via SMTP
                 if (!$mailer->send($replyMessage)) {
                     DB::rollBack();
                     return [
@@ -163,6 +174,7 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
                 // Increment the success counter after sending a reply
                 $successCount++;
 
+                // Log the reply in the EmailReply model
                 EmailReply::create([
                     'user_id'           => $user->id,
                     'received_email_id' => $received->id,
@@ -175,6 +187,7 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
                     'replied_at'        => Carbon::now()
                 ]);
 
+                // Store the sent reply in the Sent folder
                 $sentFolder = $client->getFolder('Sent');
                 $sentFolder->appendMessage($replyMessage->toString(), [
                     'date' => Carbon::now()->toRfc2822String()
@@ -199,95 +212,173 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
     }
 
 
+    public function processMessage($originalMessage, $emailContent, $user)
+    {
+        $originSubject = $originalMessage->getSubject()->first() ?? "No Subject";
+        $emailFrom = $originalMessage->getFrom()->first()->mail ?? null;
+        $nameFrom = $originalMessage->getFrom()->first()->personal ?? "No Sender Name";
+        $body = $originalMessage->getHTMLBody() ?: $originalMessage->getTextBody() ?: "No Body";
+        $receivedAt = $originalMessage->getDate();
+
+        if ($emailFrom === null) {
+            return $this->generateErrorResponse("Sender does not have an email");
+        }
+
+        $originalMessageId = $originalMessage->getMessageId()->first();
+
+        $exists = EmailReceived::where('user_id', $user->id)
+            ->where('message_id', $originalMessageId)
+            ->where('subject', $originSubject)
+            ->where('from_email', $emailFrom)
+            ->where('body', $body)
+            ->where('received_at', $receivedAt)
+            ->first();
+
+        if ($exists) {
+            return ["sukses" => true]; // Skip already processed message
+        }
+
+        $received = EmailReceived::create([
+            'user_id'     => $user->id,
+            'message_id'  => $originalMessageId,
+            'subject'     => $originSubject,
+            'from_email'  => $emailFrom,
+            'from_name'   => $nameFrom,
+            'body'        => $body,
+            'received_at' => $receivedAt
+        ]);
+
+        return ['sukses' => true, 'received' => $received];
+    }
+
+    public function sendAutoReplyEmail($originalMessage, $emailContent, $user, $mailServerSetting)
+    {
+        $transport = (new Swift_SmtpTransport($mailServerSetting->host, 587, 'tls'))
+            ->setUsername($mailServerSetting->username)
+            ->setPassword($mailServerSetting->password);
+
+        $mailer = new Swift_Mailer($transport);
+        $ccEmails = $emailContent->cc ? array_map('trim', explode(',', $emailContent->cc)) : [];
+
+        $replyMessage = (new \Swift_Message("Re: " . $originalMessage->getSubject()->first()))
+            ->setFrom([$user->email => $user->name])
+            ->setTo([$originalMessage->getFrom()->first()->mail => $originalMessage->getFrom()->first()->personal])
+            ->setBody($emailContent->body, 'text/html')
+            ->addPart(strip_tags($emailContent->body), 'text/plain');
+
+        if (!empty($ccEmails)) {
+            $replyMessage->setCc($ccEmails);
+        }
+
+        $replyMessage->getHeaders()->addTextHeader('In-Reply-To', $originalMessage->getMessageId()->first());
+        $replyMessage->getHeaders()->addTextHeader('References', $originalMessage->getMessageId()->first());
+
+        $mailer->send($replyMessage);
+
+        // Log the reply in the database
+        EmailReply::create([
+            'user_id'           => $user->id,
+            'received_email_id' => $received->id,
+            'to_email'          => $originalMessage->getFrom()->first()->mail,
+            'from_email'        => $user->email,
+            'subject'           => $originalMessage->getSubject()->first(),
+            'body'              => $emailContent->body,
+            'cc'                => $emailContent->cc,
+            'success'           => 1,
+            'replied_at'        => Carbon::now()
+        ]);
+
+        // Add message to Sent folder
+        $sentFolder = $client->getFolder('Sent');
+        $sentFolder->appendMessage($replyMessage->toString(), [
+            'date' => Carbon::now()->toRfc2822String()
+        ]);
+    }
 
     public function getAllById($dataId, $search, $page)
     {
         try {
-
             $user = User::find($dataId);
-
             if (!$user) {
-                return [
-                    "sukses" => false,
-                    "pesan" => "User not found for ID"
-                ];
+                return $this->generateErrorResponse("User not found for ID");
             }
 
-            $model = EmailReceived::with($this->relations)->where('user_id', $user->id);
+            $query = EmailReceived::with($this->relations)->where('user_id', $user->id);
 
-            if ($search === null) {
-                $query = $model->orderBy('updated_at','desc');
-            } else {
-                $query = $model
-                ->where('from_email', 'like', '%'.$search.'%')
-                ->orWhere('subject', 'like', '%'.$search.'%')
-                ->orderBy('updated_at','desc');
+            if ($search) {
+                $query->where('from_email', 'like', '%' . $search . '%')
+                    ->orWhere('subject', 'like', '%' . $search . '%');
             }
+
+            $query->orderBy('updated_at', 'desc');
 
             $cantSend = $this->canSend($dataId);
 
             if ($cantSend['sukses'] === true) {
 
-                $sendAutoReply = $this->sendAutoReply(
-                    $cantSend['mailServerSetting'],
-                    $cantSend['emailContent'],
-                    $user,
-                    $cantSend['client']
-                );
+                $sendAutoReply = $this->sendAutoReply($cantSend['mailServerSetting'], $cantSend['emailContent'], $user, $cantSend['client']);
 
-                if ($sendAutoReply['sukses'] === true) {
-                    if ($sendAutoReply['jumlah_berhasil'] != 0) {
-                        return [
-                            "sukses" => true,
-                            "pesan"  => $sendAutoReply['pesan'],
-                            "datas"  => $query->paginate($page),
-                            'jumlah_berhasil' => "Number Of Recently Sent Auto Replies " . $sendAutoReply['jumlah_berhasil']
-                        ];
-                    } else {
-                        return [
-                            "sukses" => true,
-                            "pesan"  => $sendAutoReply['pesan'],
-                            "datas"  => $query->paginate($page),
-                            'jumlah_berhasil' => "No New Email Incoming"
-                        ];
-                    }
+                $result = [
+                    "sukses" => true,
+                    "pesan" => $sendAutoReply['pesan'],
+                    "datas" => $query->paginate($page)
+                ];
 
+                if ($sendAutoReply['sukses'] === true && $sendAutoReply['jumlah_berhasil'] != 0) {
+
+                    $result['jumlah_berhasil'] = "Number Of Recently Sent Auto Replies: " . $sendAutoReply['jumlah_berhasil'];
 
                 } else {
-                    return [
-                        "sukses" => false,
-                        "pesan" => $sendAutoReply['pesan'],
-                        "datas"  => $query->paginate($page)
-                    ];
-                }
 
+                    $result['jumlah_berhasil'] = "No New Email Incoming";
+
+                }
+                return $result;
             } else {
                 return [
                     "sukses" => false,
-                    "pesan"  => $cantSend['pesan'],
-                    "datas"  =>  $query->paginate($page)
+                    "pesan" => $cantSend['pesan'],
+                    "datas" => $query->paginate($page)
                 ];
             }
 
-
         } catch (\Exception $e) {
-
-            $model = EmailReceived::with($this->relations)->where('user_id', $user->id);
-
-            if ($search === null) {
-                $query = $model->orderBy('updated_at','desc');
-            } else {
-                $query = $model
-                ->where('from_email', 'like', '%'.$search.'%')
-                ->orWhere('subject', 'like', '%'.$search.'%')
-                ->orderBy('updated_at','desc');
-            }
-
-            return [
-                "sukses" => false,
-                "pesan" =>  $e->getMessage(),
-                "datas"  => $query->paginate($page)
-            ];
+            return $this->generateErrorResponse($e->getMessage());
         }
     }
+
+    // public function autoReplyForCommand($userEmail)
+    // {
+    //     $user = User::where('email', $userEmail)->first()->id;
+
+    //     if (!$user) {
+    //         return $this->generateErrorResponse("User not found for ID");
+    //     }
+
+    //     $cantSend = $this->canSend($user);
+
+    //     if ($cantSend['sukses'] === true) {
+
+    //         $sendAutoReply = $this->sendAutoReply($cantSend['mailServerSetting'], $cantSend['emailContent'], $user, $cantSend['client']);
+
+    //         $result = [
+    //             "sukses" => true,
+    //             "pesan" => $sendAutoReply['pesan'],
+    //         ];
+
+    //         if ($sendAutoReply['sukses'] === true && $sendAutoReply['jumlah_berhasil'] != 0) {
+    //             $result['jumlah_berhasil'] = "Number Of Recently Sent Auto Replies: " . $sendAutoReply['jumlah_berhasil'];
+    //         } else {
+    //             $result['jumlah_berhasil'] = "No New Email Incoming";
+    //         }
+
+    //         return $result;
+
+    //     } else {
+    //         return [
+    //             "sukses" => false,
+    //             "pesan" => $cantSend['pesan'],
+    //         ];
+    //     }
+    // }
 }
