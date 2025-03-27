@@ -149,7 +149,7 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
                 ]);
 
                 // Create SwiftMailer transport and initialize the mailer
-                $transport = (new Swift_SmtpTransport($mailServerSetting->host, 587, 'tls'))
+                $transport = (new Swift_SmtpTransport($mailServerSetting->host, 587, 'ssl'))
                     ->setUsername($mailServerSetting->username)
                     ->setPassword($mailServerSetting->password);
 
@@ -277,7 +277,7 @@ class EmailRecievedRepository implements EmailRecievedRepositoryInterface
 
         try {
 
-            $transport = (new Swift_SmtpTransport($mailServerSetting->host, 587, 'tls'))
+            $transport = (new Swift_SmtpTransport($mailServerSetting->host, 587, 'ssl'))
             ->setUsername($mailServerSetting->username)
             ->setPassword($mailServerSetting->password);
 
